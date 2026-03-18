@@ -57,6 +57,57 @@ func (s *EncoderAdvancedSuite) TestEncodeDecodeNoDeltaCompression() {
 	}
 }
 
+// BenchmarkEncodeFromPackfile benchmarks encoding from a packfile-backed
+// filesystem storage, which exercises the raw-copy optimization for packWindow=0.
+func BenchmarkEncodeFromPackfile(b *testing.B) {
+	fixs := fixtures.Basic().ByTag("packfile").ByTag(".git")
+	f := fixs.One()
+	storage := filesystem.NewStorage(f.DotGit(), cache.NewObjectLRUDefault())
+
+	objIter, err := storage.IterEncodedObjects(plumbing.AnyObject)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	var hashes []plumbing.Hash
+	_ = objIter.ForEach(func(o plumbing.EncodedObject) error {
+		hashes = append(hashes, o.Hash())
+		return nil
+	})
+
+	b.Run("delta10", func(b *testing.B) {
+		var totalBytes int64
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			buf := bytes.NewBuffer(nil)
+			enc := NewEncoder(buf, storage, false)
+			if _, err := enc.Encode(hashes, 10); err != nil {
+				b.Fatal(err)
+			}
+			totalBytes = int64(buf.Len())
+		}
+		b.StopTimer()
+		b.ReportMetric(float64(totalBytes), "output-bytes")
+		b.ReportMetric(float64(len(hashes)), "objects")
+	})
+
+	b.Run("delta0", func(b *testing.B) {
+		var totalBytes int64
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			buf := bytes.NewBuffer(nil)
+			enc := NewEncoder(buf, storage, false)
+			if _, err := enc.Encode(hashes, 0); err != nil {
+				b.Fatal(err)
+			}
+			totalBytes = int64(buf.Len())
+		}
+		b.StopTimer()
+		b.ReportMetric(float64(totalBytes), "output-bytes")
+		b.ReportMetric(float64(len(hashes)), "objects")
+	})
+}
+
 func (s *EncoderAdvancedSuite) testEncodeDecode(
 	storage storer.Storer,
 	packWindow uint,

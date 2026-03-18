@@ -87,8 +87,25 @@ func (dw *deltaSelector) objectsToPack(
 	hashes []plumbing.Hash,
 	packWindow uint,
 ) ([]*ObjectToPack, error) {
+	// Check if the storer supports raw object access for the fast path.
+	rawStorer, hasRaw := dw.storer.(storer.RawObjectStorer)
+
 	objectsToPack := make([]*ObjectToPack, 0, len(hashes))
 	for _, h := range hashes {
+		// Fast path: when packWindow==0 and the storer can provide raw
+		// compressed bytes, avoid decompressing entirely.
+		if packWindow == 0 && hasRaw {
+			typ, sz, reader, err := rawStorer.RawObject(h)
+			if err == nil {
+				obj := &rawObject{typ: typ, sz: sz, hash: h}
+				otp := newObjectToPack(obj)
+				otp.RawCompressed = reader
+				objectsToPack = append(objectsToPack, otp)
+				continue
+			}
+			// Fall through to slow path on error (e.g. delta objects, loose objects).
+		}
+
 		var o plumbing.EncodedObject
 		var err error
 		if packWindow == 0 {

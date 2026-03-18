@@ -46,6 +46,18 @@ type EncodedObjectStorer interface {
 	AddAlternate(remote string) error
 }
 
+// RawObjectStorer is an optional interface for storage backends that can
+// provide raw zlib-compressed object data without decompressing it.
+// This enables the packfile encoder to copy pre-compressed bytes directly,
+// avoiding a decompress-recompress cycle.
+type RawObjectStorer interface {
+	// RawObject returns the object type, uncompressed size, and a reader
+	// over the raw zlib-compressed bytes for the given hash.
+	// Returns plumbing.ErrObjectNotFound if the object is not found or
+	// if it's a delta object that can't be served raw.
+	RawObject(h plumbing.Hash) (typ plumbing.ObjectType, size int64, r io.ReadCloser, err error)
+}
+
 // DeltaObjectStorer is an EncodedObjectStorer that can return delta
 // objects.
 type DeltaObjectStorer interface {

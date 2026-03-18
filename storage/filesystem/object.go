@@ -720,6 +720,80 @@ func (s *ObjectStorage) decodeDeltaObjectAt(
 	return newDeltaObject(obj, hash, base, header.Size), nil
 }
 
+// RawObject returns the object type, uncompressed size, and a reader over
+// the raw zlib-compressed bytes for the given hash, without decompressing.
+// This enables the packfile encoder to avoid the decompress-recompress cycle.
+func (s *ObjectStorage) RawObject(h plumbing.Hash) (plumbing.ObjectType, int64, io.ReadCloser, error) {
+	if err := s.requireIndex(); err != nil {
+		return 0, 0, nil, err
+	}
+
+	pack, _, offset := s.findObjectInPackfile(h)
+	if offset == -1 {
+		return 0, 0, nil, plumbing.ErrObjectNotFound
+	}
+
+	s.muI.RLock()
+	idx := s.index[pack]
+	s.muI.RUnlock()
+
+	// Build sorted offsets for the packfile.
+	sortedOffsets, err := s.sortedPackOffsets(idx)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+
+	// Get the pack file size.
+	packFile, err := s.dir.ObjectPack(pack)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+
+	packSize, err := packFile.Seek(0, io.SeekEnd)
+	if err != nil {
+		packFile.Close()
+		return 0, 0, nil, err
+	}
+	packFile.Close()
+
+	p, err := s.packfile(idx, pack)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+
+	if !s.options.KeepDescriptors && s.options.MaxOpenDescriptors == 0 {
+		// GetRawCompressed reads all bytes into memory, so we can close after.
+		defer func() {
+			_ = p.Close()
+		}()
+	}
+
+	return p.GetRawCompressed(offset, sortedOffsets, packSize)
+}
+
+// sortedPackOffsets returns a sorted slice of all object offsets from the index.
+func (s *ObjectStorage) sortedPackOffsets(idx idxfile.Index) ([]int64, error) {
+	entries, err := idx.EntriesByOffset()
+	if err != nil {
+		return nil, err
+	}
+
+	var offsets []int64
+	for {
+		entry, err := entries.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		offsets = append(offsets, int64(entry.Offset))
+	}
+	_ = entries.Close()
+
+	return offsets, nil
+}
+
 func (s *ObjectStorage) findObjectInPackfile(h plumbing.Hash) (plumbing.Hash, plumbing.Hash, int64) {
 	defer s.muI.Unlock()
 	s.muI.Lock()

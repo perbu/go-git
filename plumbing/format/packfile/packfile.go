@@ -2,9 +2,11 @@ package packfile
 
 import (
 	"bufio"
+	"bytes"
 	"crypto"
 	"fmt"
 	"io"
+	"sort"
 	"sync"
 
 	billy "github.com/go-git/go-billy/v6"
@@ -241,6 +243,56 @@ func (p *Packfile) init() error {
 	})
 
 	return p.onceErr
+}
+
+// GetRawCompressed returns the object type, uncompressed size, and a reader
+// over the raw zlib-compressed bytes for the object at the given offset.
+// sortedOffsets must be a sorted slice of all object offsets in the packfile,
+// and packSize is the total size of the packfile.
+// Returns an error if the object is a delta type.
+func (p *Packfile) GetRawCompressed(offset int64, sortedOffsets []int64, packSize int64) (plumbing.ObjectType, int64, io.ReadCloser, error) {
+	if err := p.init(); err != nil {
+		return 0, 0, nil, err
+	}
+	p.m.Lock()
+	defer p.m.Unlock()
+
+	oh, err := p.headerFromOffset(offset)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+
+	if oh.Type.IsDelta() {
+		return 0, 0, nil, fmt.Errorf("delta object at offset %d, cannot serve raw", offset)
+	}
+
+	// Find the next object's offset using binary search on sorted offsets.
+	nextOffset := packSize - int64(p.objectIdSize) // default: last object
+	i := sort.Search(len(sortedOffsets), func(i int) bool {
+		return sortedOffsets[i] > offset
+	})
+	if i < len(sortedOffsets) {
+		nextOffset = sortedOffsets[i]
+	}
+
+	compressedSize := nextOffset - oh.ContentOffset
+	if compressedSize <= 0 {
+		return 0, 0, nil, fmt.Errorf("invalid compressed size %d at offset %d", compressedSize, offset)
+	}
+
+	// Seek to the content offset and read the raw compressed bytes.
+	_, err = p.scanner.Seek(oh.ContentOffset, io.SeekStart)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+
+	buf := make([]byte, compressedSize)
+	_, err = io.ReadFull(p.scanner, buf)
+	if err != nil {
+		return 0, 0, nil, fmt.Errorf("reading compressed data: %w", err)
+	}
+
+	return oh.Type, oh.Size, io.NopCloser(bytes.NewReader(buf)), nil
 }
 
 func (p *Packfile) headerFromOffset(offset int64) (*ObjectHeader, error) {

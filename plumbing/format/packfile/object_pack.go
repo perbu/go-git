@@ -1,6 +1,8 @@
 package packfile
 
 import (
+	"io"
+
 	"github.com/go-git/go-git/v6/plumbing"
 )
 
@@ -23,6 +25,11 @@ type ObjectToPack struct {
 	// offset in pack when object has been already written, or 0 if it
 	// has not been written yet
 	Offset int64
+
+	// RawCompressed holds a reader over pre-compressed zlib data from a
+	// source packfile. When set, the encoder copies these bytes directly
+	// to the output instead of re-compressing the object content.
+	RawCompressed io.ReadCloser
 
 	// Information from the original object
 	resolvedOriginal bool
