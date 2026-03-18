@@ -41,21 +41,42 @@ func testServe[T UploadPackOptions | ReceivePackOptions](
 	return &out
 }
 
-func testAdvertise[T UploadPackOptions | ReceivePackOptions](
+func testAdvertiseUploadPack(
 	t testing.TB,
 	fun func(
 		ctx context.Context,
 		st storage.Storer,
 		r io.ReadCloser,
 		w io.WriteCloser,
-		opts *T,
+		opts *UploadPackOptions,
 	) error,
 	proto string,
 	stateless bool,
 ) *bytes.Buffer {
 	dot := fixtures.Basic().One().DotGit(fixtures.WithTargetDir(t.TempDir))
 	st := filesystem.NewStorage(dot, cache.NewObjectLRUDefault())
-	return testServe(t, st, fun, io.NopCloser(bytes.NewBuffer(nil)), &T{
+	return testServe(t, st, fun, io.NopCloser(bytes.NewBuffer(nil)), &UploadPackOptions{
+		GitProtocol:   proto,
+		AdvertiseRefs: true,
+		StatelessRPC:  stateless,
+	})
+}
+
+func testAdvertiseReceivePack(
+	t testing.TB,
+	fun func(
+		ctx context.Context,
+		st storage.Storer,
+		r io.ReadCloser,
+		w io.WriteCloser,
+		opts *ReceivePackOptions,
+	) error,
+	proto string,
+	stateless bool,
+) *bytes.Buffer {
+	dot := fixtures.Basic().One().DotGit(fixtures.WithTargetDir(t.TempDir))
+	st := filesystem.NewStorage(dot, cache.NewObjectLRUDefault())
+	return testServe(t, st, fun, io.NopCloser(bytes.NewBuffer(nil)), &ReceivePackOptions{
 		GitProtocol:   proto,
 		AdvertiseRefs: true,
 		StatelessRPC:  stateless,
