@@ -111,7 +111,7 @@ func (d *Demuxer) nextPackData() ([]byte, error) {
 		// Done demultiplex sidebands. Use io.EOF to indicate the end of
 		// sideband packets.
 		return nil, io.EOF
-	} else if l > d.max {
+	} else if l > d.max+pktline.LenSize {
 		return nil, ErrMaxPackedExceeded
 	}
 

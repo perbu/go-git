@@ -93,10 +93,17 @@ func (dw *deltaSelector) objectsToPack(
 	objectsToPack := make([]*ObjectToPack, 0, len(hashes))
 
 	// hashToOtp tracks all objects for linking raw delta bases.
-	// Only needed when packWindow==0 and the storer supports raw access.
+	// hashSet is used to verify delta bases are in the object set
+	// (needed for partial clones where not all objects are included).
+	// Only allocated when packWindow==0 and the storer supports raw access.
 	var hashToOtp map[plumbing.Hash]*ObjectToPack
+	var hashSet map[plumbing.Hash]struct{}
 	if packWindow == 0 && hasRaw {
 		hashToOtp = make(map[plumbing.Hash]*ObjectToPack, len(hashes))
+		hashSet = make(map[plumbing.Hash]struct{}, len(hashes))
+		for _, h := range hashes {
+			hashSet[h] = struct{}{}
+		}
 	}
 
 	for _, h := range hashes {
@@ -105,6 +112,14 @@ func (dw *deltaSelector) objectsToPack(
 		if packWindow == 0 && hasRaw {
 			typ, sz, baseHash, reader, err := rawStorer.RawObject(h)
 			if err == nil {
+				// For delta objects, verify the base is in our object set.
+				// Partial clones may exclude the base, making REF_DELTA invalid.
+				if !baseHash.IsZero() {
+					if _, ok := hashSet[baseHash]; !ok {
+						reader.Close()
+						goto slowPath
+					}
+				}
 				obj := &rawObject{typ: typ, sz: sz, hash: h}
 				otp := newObjectToPack(obj)
 				otp.RawCompressed = reader
@@ -117,6 +132,7 @@ func (dw *deltaSelector) objectsToPack(
 			}
 			// Fall through to slow path on error (e.g. loose objects).
 		}
+	slowPath:
 
 		var o plumbing.EncodedObject
 		var err error
@@ -147,12 +163,14 @@ func (dw *deltaSelector) objectsToPack(
 			if otp.RawDeltaBase.IsZero() {
 				continue
 			}
-			if base, ok := hashToOtp[otp.RawDeltaBase]; ok {
-				otp.Base = base
+			base, ok := hashToOtp[otp.RawDeltaBase]
+			if !ok {
+				// Should not happen: we checked hashSet before setting
+				// RawDeltaBase. Defensive fallback to non-delta.
+				otp.RawDeltaBase = plumbing.ZeroHash
+				continue
 			}
-			// If the base is not in our set, the REF_DELTA still
-			// references it by hash. For full clones all objects are
-			// present, so this should not happen.
+			otp.Base = base
 		}
 		return objectsToPack, nil
 	}
