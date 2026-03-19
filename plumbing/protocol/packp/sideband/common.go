@@ -11,8 +11,10 @@ const (
 
 	// MaxPackedSize for Sideband type
 	MaxPackedSize = 1000
-	// MaxPackedSize64k for Sideband64k type
-	MaxPackedSize64k = 65520
+	// MaxPackedSize64k for Sideband64k type.
+	// This is the maximum pktline payload size (65516), which must fit
+	// the channel byte + data within pktline's MaxPayloadSize (65520 - 4).
+	MaxPackedSize64k = 65516
 )
 
 // Channel sideband channel

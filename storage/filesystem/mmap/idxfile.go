@@ -38,7 +38,13 @@ func (s *PackScanner) loadIdxFile(idx billy.File) error {
 
 	s.idxCleanup = cleanup
 	s.idxMmap = mmap
+	s.initIdxOffsets()
 
+	return nil
+}
+
+// initIdxOffsets computes the section offsets within the loaded idx mmap.
+func (s *PackScanner) initIdxOffsets() {
 	s.count = int(binary.BigEndian.Uint32(s.idxMmap[idxHeaderSize+idxFanoutSize-4:]))
 	s.fanoutStart = idxHeaderSize
 	s.namesStart = s.fanoutStart + idxFanoutSize
@@ -46,6 +52,4 @@ func (s *PackScanner) loadIdxFile(idx billy.File) error {
 	s.off32Start = s.crcStart + (s.count * idxCrcSize)
 	s.off64Start = s.off32Start + (s.count * off32Size)
 	s.trailerStart = len(s.idxMmap) - 2*s.hashSize
-
-	return nil
 }

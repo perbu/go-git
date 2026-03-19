@@ -21,6 +21,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/hash"
 	"github.com/go-git/go-git/v6/plumbing/storer"
 	"github.com/go-git/go-git/v6/storage/filesystem/dotgit"
+	"github.com/go-git/go-git/v6/storage/filesystem/mmap"
 	"github.com/go-git/go-git/v6/utils/ioutil"
 )
 
@@ -39,6 +40,9 @@ type ObjectStorage struct {
 	packfiles   map[plumbing.Hash]*packfile.Packfile
 	muI         sync.RWMutex
 	muP         sync.RWMutex
+
+	rawScanners map[plumbing.Hash]*mmap.PackScanner
+	muRS        sync.RWMutex
 
 	oh *plumbing.ObjectHasher
 
@@ -723,6 +727,7 @@ func (s *ObjectStorage) decodeDeltaObjectAt(
 // RawObject returns the object type, uncompressed size, and a reader over
 // the raw zlib-compressed bytes for the given hash, without decompressing.
 // This enables the packfile encoder to avoid the decompress-recompress cycle.
+// Uses mmap for zero-copy access to the packfile data on supported platforms.
 func (s *ObjectStorage) RawObject(h plumbing.Hash) (plumbing.ObjectType, int64, io.ReadCloser, error) {
 	if err := s.requireIndex(); err != nil {
 		return 0, 0, nil, err
@@ -733,65 +738,52 @@ func (s *ObjectStorage) RawObject(h plumbing.Hash) (plumbing.ObjectType, int64, 
 		return 0, 0, nil, plumbing.ErrObjectNotFound
 	}
 
-	s.muI.RLock()
-	idx := s.index[pack]
-	s.muI.RUnlock()
-
-	// Build sorted offsets for the packfile.
-	sortedOffsets, err := s.sortedPackOffsets(idx)
+	rs, err := s.rawScanner(pack)
 	if err != nil {
 		return 0, 0, nil, err
 	}
 
-	// Get the pack file size.
-	packFile, err := s.dir.ObjectPack(pack)
-	if err != nil {
-		return 0, 0, nil, err
-	}
-
-	packSize, err := packFile.Seek(0, io.SeekEnd)
-	if err != nil {
-		packFile.Close()
-		return 0, 0, nil, err
-	}
-	packFile.Close()
-
-	p, err := s.packfile(idx, pack)
-	if err != nil {
-		return 0, 0, nil, err
-	}
-
-	if !s.options.KeepDescriptors && s.options.MaxOpenDescriptors == 0 {
-		// GetRawCompressed reads all bytes into memory, so we can close after.
-		defer func() {
-			_ = p.Close()
-		}()
-	}
-
-	return p.GetRawCompressed(offset, sortedOffsets, packSize)
+	return rs.GetRawCompressed(h)
 }
 
-// sortedPackOffsets returns a sorted slice of all object offsets from the index.
-func (s *ObjectStorage) sortedPackOffsets(idx idxfile.Index) ([]int64, error) {
-	entries, err := idx.EntriesByOffset()
+// rawScanner returns a cached mmap-based PackScanner for the given packfile,
+// creating one on first access.
+func (s *ObjectStorage) rawScanner(pack plumbing.Hash) (*mmap.PackScanner, error) {
+	s.muRS.RLock()
+	if s.rawScanners != nil {
+		if rs, ok := s.rawScanners[pack]; ok {
+			s.muRS.RUnlock()
+			return rs, nil
+		}
+	}
+	s.muRS.RUnlock()
+
+	s.muRS.Lock()
+	defer s.muRS.Unlock()
+
+	if s.rawScanners == nil {
+		s.rawScanners = make(map[plumbing.Hash]*mmap.PackScanner)
+	}
+	if rs, ok := s.rawScanners[pack]; ok {
+		return rs, nil
+	}
+
+	packFile, err := s.dir.ObjectPack(pack)
 	if err != nil {
 		return nil, err
 	}
-
-	var offsets []int64
-	for {
-		entry, err := entries.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		offsets = append(offsets, int64(entry.Offset))
+	idxFile, err := s.dir.ObjectPackIdx(pack)
+	if err != nil {
+		_ = packFile.Close()
+		return nil, err
 	}
-	_ = entries.Close()
 
-	return offsets, nil
+	rs, err := mmap.NewPackScannerRaw(pack.Size(), packFile, idxFile)
+	if err != nil {
+		return nil, err
+	}
+	s.rawScanners[pack] = rs
+	return rs, nil
 }
 
 func (s *ObjectStorage) findObjectInPackfile(h plumbing.Hash) (plumbing.Hash, plumbing.Hash, int64) {
@@ -922,6 +914,16 @@ func (s *ObjectStorage) Close() error {
 			}
 		}
 	}
+
+	// Close mmap-based raw scanners.
+	s.muRS.Lock()
+	for _, rs := range s.rawScanners {
+		if err := rs.Close(); firstError == nil && err != nil {
+			firstError = err
+		}
+	}
+	s.rawScanners = nil
+	s.muRS.Unlock()
 
 	// If the index being used implements io.Closer, make sure we call it.
 	// LazyIndex.Close permanently disables the index and releases any

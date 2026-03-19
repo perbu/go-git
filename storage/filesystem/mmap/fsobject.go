@@ -232,15 +232,7 @@ func (o *ondemandObject) resolveMetadata() error {
 
 // toDataOffset gets the object offset and returns the data offset.
 func (o *ondemandObject) toDataOffset(offset int64) int64 {
-	first := o.scanner.packMmap[offset] // Skip type byte.
-	offset++
-
-	// Skip the size bytes (variable length encoding).
-	for first&maskContinue != 0 {
-		first = o.scanner.packMmap[offset]
-		offset++
-	}
-	return offset
+	return int64(o.scanner.dataOffset(uint64(offset)))
 }
 
 // resolveDelta resolves a delta object by getting the base and applying the patch.

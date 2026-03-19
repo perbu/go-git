@@ -9,7 +9,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
+	gosync "sync"
 
 	"github.com/go-git/go-billy/v6"
 
@@ -45,6 +47,10 @@ type PackScanner struct {
 	idxCleanup  func() error
 	revMmap     []byte
 	revCleanup  func() error
+
+	// Lazily computed sorted pack offsets for raw compressed access.
+	sortedOnce gosync.Once
+	sortedOffs []uint64
 }
 
 func NewPackScanner(hashSize int, pack, idx, rev billy.File) (*PackScanner, error) {
@@ -246,6 +252,134 @@ func compareObjectID(names []byte, idx int, want []byte) int {
 	}
 
 	return bytes.Compare(names[base:end], want)
+}
+
+// readFileData tries mmap first, falling back to reading the entire file
+// into memory when the file descriptor is not available (e.g. chroot fs).
+func readFileData(f billy.File) ([]byte, func() error, error) {
+	// Try mmap first.
+	data, cleanup, err := mmapFile(f)
+	if err == nil {
+		return data, cleanup, nil
+	}
+
+	// Fallback: read entire file into memory.
+	if _, seekErr := f.Seek(0, io.SeekStart); seekErr != nil {
+		return nil, nil, errors.Join(err, seekErr, f.Close())
+	}
+	data, readErr := io.ReadAll(f)
+	if readErr != nil {
+		return nil, nil, errors.Join(readErr, f.Close())
+	}
+	cleanup = func() error { return f.Close() }
+	return data, cleanup, nil
+}
+
+// NewPackScannerRaw creates a PackScanner for raw object access that only
+// requires pack and idx files (no reverse index needed). Falls back to
+// reading files into memory when mmap is not available.
+func NewPackScannerRaw(hashSize int, pack, idx billy.File) (*PackScanner, error) {
+	s := &PackScanner{hashSize: hashSize}
+
+	// Load pack file (try mmap, fallback to read).
+	packData, packCleanup, err := readFileData(pack)
+	if err != nil {
+		return nil, fmt.Errorf("cannot load .pack file: %w", err)
+	}
+	if err := validateFile(packData, packSupported, packSignature, packMinLen); err != nil {
+		_ = packCleanup()
+		return nil, fmt.Errorf("malformed pack file: %w", err)
+	}
+	s.packMmap = packData
+	s.packCleanup = packCleanup
+
+	// Load idx file (try mmap, fallback to read).
+	idxData, idxCleanup, err := readFileData(idx)
+	if err != nil {
+		_ = s.packCleanup()
+		return nil, fmt.Errorf("cannot load .idx file: %w", err)
+	}
+	if err := validateFile(idxData, idxSupported, idxSignature, idxMinLen); err != nil {
+		_ = idxCleanup()
+		_ = s.packCleanup()
+		return nil, fmt.Errorf("malformed idx file: %w", err)
+	}
+	s.idxCleanup = idxCleanup
+	s.idxMmap = idxData
+	s.initIdxOffsets()
+
+	s.revCleanup = func() error { return nil }
+	return s, nil
+}
+
+// GetRawCompressed returns the object type, uncompressed size, and a reader
+// over the raw zlib-compressed bytes for the given hash. The returned reader
+// is a zero-copy view into the mmap'd packfile data.
+// Returns an error for delta objects (which must be resolved via the slow path).
+func (s *PackScanner) GetRawCompressed(h plumbing.Hash) (plumbing.ObjectType, int64, io.ReadCloser, error) {
+	offset, err := s.FindOffset(h)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+
+	if int(offset) >= len(s.packMmap) {
+		return 0, 0, nil, ErrOffsetNotFound
+	}
+
+	first := s.packMmap[offset]
+	typ := packutil.ObjectType(first)
+	if typ.IsDelta() {
+		return 0, 0, nil, fmt.Errorf("delta object at offset %d", offset)
+	}
+
+	size, err := packutil.VariableLengthSize(first, bytes.NewReader(s.packMmap[offset+1:]))
+	if err != nil {
+		return 0, 0, nil, err
+	}
+
+	contentOffset := s.dataOffset(offset)
+	nextOff := s.nextObjectOffset(offset)
+
+	data := s.packMmap[contentOffset:nextOff]
+	return typ, int64(size), io.NopCloser(bytes.NewReader(data)), nil
+}
+
+// dataOffset returns the offset of the compressed data after the variable-length
+// object header at the given pack offset.
+func (s *PackScanner) dataOffset(offset uint64) uint64 {
+	pos := offset + 1
+	for s.packMmap[pos-1]&maskContinue != 0 {
+		pos++
+	}
+	return pos
+}
+
+// buildSortedOffsets lazily computes a sorted list of all object offsets
+// from the idx. This is computed once and cached for subsequent lookups.
+func (s *PackScanner) buildSortedOffsets() {
+	s.sortedOnce.Do(func() {
+		s.sortedOffs = make([]uint64, s.count)
+		for i := 0; i < s.count; i++ {
+			off, _ := s.offset(i)
+			s.sortedOffs[i] = off
+		}
+		sort.Slice(s.sortedOffs, func(i, j int) bool {
+			return s.sortedOffs[i] < s.sortedOffs[j]
+		})
+	})
+}
+
+// nextObjectOffset returns the pack offset of the next object after the one
+// at the given offset. For the last object, returns the checksum offset.
+func (s *PackScanner) nextObjectOffset(offset uint64) uint64 {
+	s.buildSortedOffsets()
+	i := sort.Search(len(s.sortedOffs), func(i int) bool {
+		return s.sortedOffs[i] > offset
+	})
+	if i < len(s.sortedOffs) {
+		return s.sortedOffs[i]
+	}
+	return uint64(len(s.packMmap) - s.hashSize)
 }
 
 // Close releases all memory-mapped resources and closes the underlying files.

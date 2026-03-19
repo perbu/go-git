@@ -2,6 +2,7 @@ package packfile
 
 import (
 	"io"
+	"strings"
 
 	"github.com/go-git/go-git/v6/plumbing"
 )
@@ -21,5 +22,5 @@ func (o *rawObject) Type() plumbing.ObjectType          { return o.typ }
 func (o *rawObject) SetType(t plumbing.ObjectType)      { o.typ = t }
 func (o *rawObject) Size() int64                        { return o.sz }
 func (o *rawObject) SetSize(s int64)                    { o.sz = s }
-func (o *rawObject) Reader() (io.ReadCloser, error)     { return io.NopCloser(io.LimitReader(nil, 0)), nil }
+func (o *rawObject) Reader() (io.ReadCloser, error)     { return io.NopCloser(strings.NewReader("")), nil }
 func (o *rawObject) Writer() (io.WriteCloser, error)    { return nil, nil }
