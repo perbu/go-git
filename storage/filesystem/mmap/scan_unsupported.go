@@ -21,8 +21,8 @@ func NewPackScannerRaw(hashSize int, pack, idx billy.File) (*PackScanner, error)
 	return nil, errors.New("pack scanner is only supported in linux or darwin")
 }
 
-func (s *PackScanner) GetRawCompressed(h plumbing.Hash) (plumbing.ObjectType, int64, io.ReadCloser, error) {
-	return 0, 0, nil, errors.New("pack scanner is only supported in linux or darwin")
+func (s *PackScanner) GetRawCompressed(h plumbing.Hash) (plumbing.ObjectType, int64, plumbing.Hash, io.ReadCloser, error) {
+	return 0, 0, plumbing.ZeroHash, nil, errors.New("pack scanner is only supported in linux or darwin")
 }
 
 func (s *PackScanner) Close() error {

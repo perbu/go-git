@@ -31,6 +31,11 @@ type ObjectToPack struct {
 	// to the output instead of re-compressing the object content.
 	RawCompressed io.ReadCloser
 
+	// RawDeltaBase is the hash of the base object for raw delta entries.
+	// When non-zero (and RawCompressed is set), the encoder emits this
+	// object as a REF_DELTA entry referencing the base by hash.
+	RawDeltaBase plumbing.Hash
+
 	// Information from the original object
 	resolvedOriginal bool
 	originalType     plumbing.ObjectType

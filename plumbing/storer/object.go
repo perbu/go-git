@@ -51,11 +51,16 @@ type EncodedObjectStorer interface {
 // This enables the packfile encoder to copy pre-compressed bytes directly,
 // avoiding a decompress-recompress cycle.
 type RawObjectStorer interface {
-	// RawObject returns the object type, uncompressed size, and a reader
-	// over the raw zlib-compressed bytes for the given hash.
-	// Returns plumbing.ErrObjectNotFound if the object is not found or
-	// if it's a delta object that can't be served raw.
-	RawObject(h plumbing.Hash) (typ plumbing.ObjectType, size int64, r io.ReadCloser, err error)
+	// RawObject returns the object type, uncompressed size, base hash, and
+	// a reader over the raw zlib-compressed bytes for the given hash.
+	//
+	// For non-delta objects, baseHash is zero and the reader contains the
+	// compressed object content.
+	//
+	// For delta objects, baseHash is the hash of the base object and the
+	// reader contains the compressed delta instruction stream. The type
+	// returned is the on-disk type (OFS_DELTA or REF_DELTA).
+	RawObject(h plumbing.Hash) (typ plumbing.ObjectType, size int64, baseHash plumbing.Hash, r io.ReadCloser, err error)
 }
 
 // DeltaObjectStorer is an EncodedObjectStorer that can return delta

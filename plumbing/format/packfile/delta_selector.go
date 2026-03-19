@@ -91,19 +91,31 @@ func (dw *deltaSelector) objectsToPack(
 	rawStorer, hasRaw := dw.storer.(storer.RawObjectStorer)
 
 	objectsToPack := make([]*ObjectToPack, 0, len(hashes))
+
+	// hashToOtp tracks all objects for linking raw delta bases.
+	// Only needed when packWindow==0 and the storer supports raw access.
+	var hashToOtp map[plumbing.Hash]*ObjectToPack
+	if packWindow == 0 && hasRaw {
+		hashToOtp = make(map[plumbing.Hash]*ObjectToPack, len(hashes))
+	}
+
 	for _, h := range hashes {
 		// Fast path: when packWindow==0 and the storer can provide raw
 		// compressed bytes, avoid decompressing entirely.
 		if packWindow == 0 && hasRaw {
-			typ, sz, reader, err := rawStorer.RawObject(h)
+			typ, sz, baseHash, reader, err := rawStorer.RawObject(h)
 			if err == nil {
 				obj := &rawObject{typ: typ, sz: sz, hash: h}
 				otp := newObjectToPack(obj)
 				otp.RawCompressed = reader
+				if !baseHash.IsZero() {
+					otp.RawDeltaBase = baseHash
+				}
 				objectsToPack = append(objectsToPack, otp)
+				hashToOtp[h] = otp
 				continue
 			}
-			// Fall through to slow path on error (e.g. delta objects, loose objects).
+			// Fall through to slow path on error (e.g. loose objects).
 		}
 
 		var o plumbing.EncodedObject
@@ -123,9 +135,25 @@ func (dw *deltaSelector) objectsToPack(
 		}
 
 		objectsToPack = append(objectsToPack, otp)
+		if hashToOtp != nil {
+			hashToOtp[o.Hash()] = otp
+		}
 	}
 
 	if packWindow == 0 {
+		// Link raw delta objects to their base ObjectToPack so the
+		// encoder writes bases before deltas (via writeBaseIfDelta).
+		for _, otp := range objectsToPack {
+			if otp.RawDeltaBase.IsZero() {
+				continue
+			}
+			if base, ok := hashToOtp[otp.RawDeltaBase]; ok {
+				otp.Base = base
+			}
+			// If the base is not in our set, the REF_DELTA still
+			// references it by hash. For full clones all objects are
+			// present, so this should not happen.
+		}
 		return objectsToPack, nil
 	}
 

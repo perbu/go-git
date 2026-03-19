@@ -128,9 +128,20 @@ func (e *Encoder) entry(o *ObjectToPack) (err error) {
 	o.Offset = e.w.Offset()
 
 	// Fast path: copy pre-compressed bytes directly from source packfile.
-	if o.RawCompressed != nil && !o.IsDelta() {
-		if err := e.entryHead(o.Type(), o.Size()); err != nil {
-			return err
+	if o.RawCompressed != nil {
+		if !o.RawDeltaBase.IsZero() {
+			// Raw delta: write REF_DELTA header + base hash + raw bytes.
+			if err := e.entryHead(plumbing.REFDeltaObject, o.Object.Size()); err != nil {
+				return err
+			}
+			if err := e.writeRefDeltaHeader(o.RawDeltaBase); err != nil {
+				return err
+			}
+		} else {
+			// Raw non-delta: write type header + raw bytes.
+			if err := e.entryHead(o.Type(), o.Size()); err != nil {
+				return err
+			}
 		}
 		_, err = io.Copy(e.w, o.RawCompressed)
 		if cerr := o.RawCompressed.Close(); err == nil {

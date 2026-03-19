@@ -728,19 +728,19 @@ func (s *ObjectStorage) decodeDeltaObjectAt(
 // the raw zlib-compressed bytes for the given hash, without decompressing.
 // This enables the packfile encoder to avoid the decompress-recompress cycle.
 // Uses mmap for zero-copy access to the packfile data on supported platforms.
-func (s *ObjectStorage) RawObject(h plumbing.Hash) (plumbing.ObjectType, int64, io.ReadCloser, error) {
+func (s *ObjectStorage) RawObject(h plumbing.Hash) (plumbing.ObjectType, int64, plumbing.Hash, io.ReadCloser, error) {
 	if err := s.requireIndex(); err != nil {
-		return 0, 0, nil, err
+		return 0, 0, plumbing.ZeroHash, nil, err
 	}
 
 	pack, _, offset := s.findObjectInPackfile(h)
 	if offset == -1 {
-		return 0, 0, nil, plumbing.ErrObjectNotFound
+		return 0, 0, plumbing.ZeroHash, nil, plumbing.ErrObjectNotFound
 	}
 
 	rs, err := s.rawScanner(pack)
 	if err != nil {
-		return 0, 0, nil, err
+		return 0, 0, plumbing.ZeroHash, nil, err
 	}
 
 	return rs.GetRawCompressed(h)

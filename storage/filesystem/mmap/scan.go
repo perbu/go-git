@@ -17,6 +17,7 @@ import (
 
 	"github.com/go-git/go-git/v6/plumbing"
 	packutil "github.com/go-git/go-git/v6/plumbing/format/packfile/util"
+	gitbinary "github.com/go-git/go-git/v6/utils/binary"
 )
 
 var (
@@ -48,9 +49,11 @@ type PackScanner struct {
 	revMmap     []byte
 	revCleanup  func() error
 
-	// Lazily computed sorted pack offsets for raw compressed access.
-	sortedOnce gosync.Once
-	sortedOffs []uint64
+	// Lazily computed idx caches for raw compressed access.
+	// Both sortedOffs and offsetHashMap are built in a single pass.
+	sortedOnce    gosync.Once
+	sortedOffs    []uint64
+	offsetHashMap map[uint64]plumbing.Hash
 }
 
 func NewPackScanner(hashSize int, pack, idx, rev billy.File) (*PackScanner, error) {
@@ -312,36 +315,106 @@ func NewPackScannerRaw(hashSize int, pack, idx billy.File) (*PackScanner, error)
 	return s, nil
 }
 
-// GetRawCompressed returns the object type, uncompressed size, and a reader
-// over the raw zlib-compressed bytes for the given hash. The returned reader
-// is a zero-copy view into the mmap'd packfile data.
-// Returns an error for delta objects (which must be resolved via the slow path).
-func (s *PackScanner) GetRawCompressed(h plumbing.Hash) (plumbing.ObjectType, int64, io.ReadCloser, error) {
+// GetRawCompressed returns the object type, uncompressed size, base hash, and
+// a reader over the raw zlib-compressed bytes for the given hash.
+//
+// For non-delta objects, baseHash is zero. For delta objects, baseHash is the
+// hash of the base object (resolved from OFS_DELTA or read from REF_DELTA),
+// and the reader contains the compressed delta instruction stream.
+//
+// The returned reader is a zero-copy view into the mmap'd packfile data.
+func (s *PackScanner) GetRawCompressed(h plumbing.Hash) (plumbing.ObjectType, int64, plumbing.Hash, io.ReadCloser, error) {
 	offset, err := s.FindOffset(h)
 	if err != nil {
-		return 0, 0, nil, err
+		return 0, 0, plumbing.ZeroHash, nil, err
 	}
 
 	if int(offset) >= len(s.packMmap) {
-		return 0, 0, nil, ErrOffsetNotFound
+		return 0, 0, plumbing.ZeroHash, nil, ErrOffsetNotFound
 	}
 
 	first := s.packMmap[offset]
 	typ := packutil.ObjectType(first)
-	if typ.IsDelta() {
-		return 0, 0, nil, fmt.Errorf("delta object at offset %d", offset)
-	}
 
 	size, err := packutil.VariableLengthSize(first, bytes.NewReader(s.packMmap[offset+1:]))
 	if err != nil {
-		return 0, 0, nil, err
+		return 0, 0, plumbing.ZeroHash, nil, err
 	}
 
-	contentOffset := s.dataOffset(offset)
-	nextOff := s.nextObjectOffset(offset)
+	// afterHeader is past the variable-length type+size header.
+	afterHeader := s.dataOffset(offset)
 
-	data := s.packMmap[contentOffset:nextOff]
-	return typ, int64(size), io.NopCloser(bytes.NewReader(data)), nil
+	var baseHash plumbing.Hash
+	var contentStart uint64
+
+	switch typ {
+	case plumbing.OFSDeltaObject:
+		// Parse the variable-width negative offset to find the base.
+		reader := bytes.NewReader(s.packMmap[afterHeader:])
+		negOffset, err := gitbinary.ReadVariableWidthInt(reader)
+		if err != nil {
+			return 0, 0, plumbing.ZeroHash, nil, fmt.Errorf("reading OFS_DELTA offset: %w", err)
+		}
+		baseOffset := offset - uint64(negOffset)
+		baseHash, err = s.findHashByOffset(baseOffset)
+		if err != nil {
+			return 0, 0, plumbing.ZeroHash, nil, fmt.Errorf("resolving OFS_DELTA base at offset %d: %w", baseOffset, err)
+		}
+		consumed := uint64(len(s.packMmap[afterHeader:])) - uint64(reader.Len())
+		contentStart = afterHeader + consumed
+
+	case plumbing.REFDeltaObject:
+		end := afterHeader + uint64(s.hashSize)
+		if int(end) > len(s.packMmap) {
+			return 0, 0, plumbing.ZeroHash, nil, ErrOffsetNotFound
+		}
+		baseHash, _ = plumbing.FromBytes(s.packMmap[afterHeader:end])
+		contentStart = end
+
+	default:
+		// Non-delta: compressed content starts right after the header.
+		contentStart = afterHeader
+	}
+
+	nextOff := s.nextObjectOffset(offset)
+	data := s.packMmap[contentStart:nextOff]
+	return typ, int64(size), baseHash, io.NopCloser(bytes.NewReader(data)), nil
+}
+
+// buildIdxCaches lazily builds both the sorted offsets list and the
+// offset→hash map in a single pass over the idx entries.
+func (s *PackScanner) buildIdxCaches() {
+	s.sortedOnce.Do(func() {
+		s.sortedOffs = make([]uint64, 0, s.count)
+		s.offsetHashMap = make(map[uint64]plumbing.Hash, s.count)
+		for i := 0; i < s.count; i++ {
+			off, err := s.offset(i)
+			if err != nil {
+				continue
+			}
+			s.sortedOffs = append(s.sortedOffs, off)
+
+			start := s.namesStart + (i * s.hashSize)
+			end := start + s.hashSize
+			if end <= s.crcStart {
+				h, _ := plumbing.FromBytes(s.idxMmap[start:end])
+				s.offsetHashMap[off] = h
+			}
+		}
+		sort.Slice(s.sortedOffs, func(i, j int) bool {
+			return s.sortedOffs[i] < s.sortedOffs[j]
+		})
+	})
+}
+
+// findHashByOffset returns the object hash at the given pack offset.
+func (s *PackScanner) findHashByOffset(offset uint64) (plumbing.Hash, error) {
+	s.buildIdxCaches()
+	h, ok := s.offsetHashMap[offset]
+	if !ok {
+		return plumbing.ZeroHash, ErrObjectNotFound
+	}
+	return h, nil
 }
 
 // dataOffset returns the offset of the compressed data after the variable-length
@@ -354,25 +427,10 @@ func (s *PackScanner) dataOffset(offset uint64) uint64 {
 	return pos
 }
 
-// buildSortedOffsets lazily computes a sorted list of all object offsets
-// from the idx. This is computed once and cached for subsequent lookups.
-func (s *PackScanner) buildSortedOffsets() {
-	s.sortedOnce.Do(func() {
-		s.sortedOffs = make([]uint64, s.count)
-		for i := 0; i < s.count; i++ {
-			off, _ := s.offset(i)
-			s.sortedOffs[i] = off
-		}
-		sort.Slice(s.sortedOffs, func(i, j int) bool {
-			return s.sortedOffs[i] < s.sortedOffs[j]
-		})
-	})
-}
-
 // nextObjectOffset returns the pack offset of the next object after the one
 // at the given offset. For the last object, returns the checksum offset.
 func (s *PackScanner) nextObjectOffset(offset uint64) uint64 {
-	s.buildSortedOffsets()
+	s.buildIdxCaches()
 	i := sort.Search(len(s.sortedOffs), func(i int) bool {
 		return s.sortedOffs[i] > offset
 	})
